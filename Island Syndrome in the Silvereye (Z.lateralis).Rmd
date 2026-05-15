@@ -1,0 +1,362 @@
+---
+title: "Island Syndrome in the Silvereye (Z.lateralis)"
+author: "anon"
+date: "2026-04-27"
+output: html_document
+---
+### Loading the necessary packages 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+#Used for the GLMMs, GLMs, and multi-model inference following the information theoretic approach
+library(renv)
+library(lme4)
+library(ggplot2)
+library(DHARMa)
+library(see)
+library(performance)
+library(partR2)
+library(dplyr) 
+library(tibble)
+library(stringr) 
+library(MASS) 
+library(arm) 
+library(MuMIn) # for multi-model inference
+library(knitr)
+library(kableExtra) 
+library(here) 
+library(tidyverse)
+library(forcats)
+library(patchwork)
+#Extra packages for Cox's proportional hazard modelling 
+library(gtsummary)
+library(survival)
+library(survminer)
+#Extra packages for growth curve analysis 
+library(growthcurver)
+require(nlme)
+library(pcvr)
+```
+
+### Loading different example datasets. 
+```{r}
+Silvereye_data_GLMM <-	read.csv("C:/Users/INSERTUSER/Documents/Silvereye_data.csv", header=T, as.is=T)#Edit this to reflect where on your device the .csv file is saved. This .csv contains the data from the Island and mainland nests as detailed in the thesis.
+Silvereye_data_Cox<-read.csv("C:/Users/INSERTUSER/Documents/Cox Plot data.csv", header=T, as.is=T) 
+Silvereye_data_Growth<-read.csv("C:/Users/INSERTUSER/Documents/Nestling growth dataset 2024-2025.csv")
+```
+
+### Example code for running the GLMs(Mainland versus island nest predation)
+```{r, warning=FALSE}
+Silvereye_data$arcsineprop<- asin(sqrt((Silvereye_data$Proportional.nest.height)/100)) #Generating an arcsine(proportional nest height) column
+Real_Nest_Data <- Silvereye_data[Silvereye_data$Fake.or.real > 0,] #Take a subset with only the natural nests. 
+Real_Nest_Data$Predated.or.not <- as.factor(Real_Nest_Data$Predated.or.not) #Setting variables as factors/numeric as required
+Real_Nest_Data$arcsineprop <- as.numeric(Real_Nest_Data$arcsineprop)
+Real_Nest_Data$No..eggs.seen <- as.numeric(Real_Nest_Data$No..eggs.seen)
+Real_Nest_Data$Bearing <- as.numeric(Real_Nest_Data$Bearing)
+Real_Nest_Data$Date.of.lay.as.a.factor <- as.numeric(Real_Nest_Data$Date.of.lay.as.a.factor)
+clean_Real_Data <- na.omit(Real_Nest_Data[, c("Predated.or.not", "Mainland.or.Island", "arcsineprop", "Date.of.lay.as.a.factor","Year")]) #Removing NAs
+Mainland_Island_Model <- glm(Predated.or.not ~ Mainland.or.Island + arcsineprop+ +(Date.of.lay.as.a.factor)+Mainland.or.Island*arcsineprop+Mainland.or.Island*Date.of.lay.as.a.factor,
+               data = clean_Real_Data,
+               family = binomial(link="probit"),na.action = "na.fail")
+#Running the GLMM, with interaction terms and a random effect of site nested in year. 
+summary(Mainland_Island_Model)
+check_model(Mainland_Island_Model, check = "outliers",residual_type = "normal") #Checking for outliers
+check_outliers(Mainland_Island_Model )
+Binned_residuals<-check_model(Mainland_Island_Model, check = "binned_residuals",residual_type = "normal")
+Binned_residuals #Checking binned residuals
+print(binned_residuals(Mainland_Island_Model))
+simulationOutput <- simulateResiduals(fittedModel = Mainland_Island_Model)
+check_residuals(simulationOutput) #Checking uniform distribution of residuals
+plot(check_residuals(simulationOutput))
+Predictions<- check_predictions(
+  Mainland_Island_Model,
+  iterations = 50,
+  check_range = FALSE,
+  re_formula = NULL,
+  bandwidth = "nrd",
+  type = "discrete_dots",
+  verbose = TRUE)
+Predictions
+#Posterior predictive check for model prediction
+Collinearity_plot<- check_collinearity(
+  Mainland_Island_Model,
+  component = c("all", "conditional", "count", "zi", "zero_inflated"),
+  ci = 0.95,
+  verbose = TRUE,
+)# this checks for collinearity using VIFs (this would be run in a model without interaction terms, as interaction terms have a high inherent collinearity)
+plot(Collinearity_plot)
+performance::check_overdispersion(Mainland_Island_Model)
+```
+### Example code for model averaging using above GLMM. 
+```{r}
+modset <- dredge(Mainland_Island_Model, rank = "AICc") #Generating all possible combinations of explanatory variables
+head(modset, n=10) 
+
+topmods <- get.models(modset, subset = delta <2) #Sorting through the top models ranked by Akaike Information Criterion for small sample sizes
+length(topmods)
+modavg <- model.avg(topmods, fit = TRUE) #Generating model averaging coefficients accross all of the top models 
+summary(modavg)
+sw(modavg)
+confint(modavg,level = 0.95)
+top.mod.params <- modset[1:length(topmods), ] %>% #Extract parameters in top models and remove and columns with all NAs (I.E. not in the top models)
+  as.data.frame() %>%
+  dplyr::select(which(colSums(!is.na(.)) > 0)) 
+
+modvars <- top.mod.params[, 1:(1 + length(sw(modavg)))] %>%  #Creates a table with the important explantory variables
+  t() %>%  
+  as.data.frame() %>%
+  rownames_to_column("Parameter") %>%
+  setNames(c("Parameter", as.character(1:length(topmods)))) %>%  # Renaming columns
+  mutate(across(-Parameter, ~ ifelse(!is.na(.), "\u2022", "")))  # Non-NA values are replaced with bullet points
+
+
+results <- MuMIn::coefTable(modavg) %>% # Table with model-averaged estimates and standard errors
+  as.data.frame() %>%
+  tibble::rownames_to_column("Parameter") %>%
+  dplyr::select(-df) %>%
+  dplyr::mutate(across(c("Estimate", "Std. Error"), ~ round(., 3))) #To 3dp
+
+modvars <- modvars %>%
+  dplyr::mutate(
+    Parameter = gsub("X.Intercept.", "(Intercept)", Parameter),
+    Parameter = gsub("\\.c", ":c", Parameter)
+    ) #Standardising the names so that they can be joined
+
+
+results$Parameter <-c("(Intercept)","arcsineprop","Date.of.lay.as.a.factor","Mainland.or.Island","Date.of.lay.as.a.factor:Mainland.or.Island","arcsineprop:Mainland.or.Island")
+results <- dplyr::left_join(results, modvars, by = "Parameter") %>%
+  dplyr::relocate(c("Estimate", "Std. Error"), .after = last_col())  #Joining important variables with their model averaged coefficients
+
+
+ci <- confint(modavg, level = 0.95) %>% #Adding 95% confidence intervals
+  as.data.frame() %>%
+  tibble::rownames_to_column("Parameter") %>%
+  dplyr::rename(LCI = `2.5 %`, UCI = `97.5 %`) %>%
+  dplyr::mutate(across(c(LCI, UCI), ~ formatC(., format = "f", digits = 3, flag = "0")),
+         `95%CI` = paste0("(", LCI, ", ", UCI, ")")) %>%
+  dplyr::select(Parameter, `95%CI`)
+ci$Parameter <-c("(Intercept)","arcsineprop","Date.of.lay.as.a.factor","Mainland.or.Island","Date.of.lay.as.a.factor:Mainland.or.Island","arcsineprop:Mainland.or.Island")
+results <- dplyr::left_join(results, ci, by = "Parameter")  #Adding confints to results
+
+varimp <- sw(modavg) %>% # Adding weighted importance (wip)
+  as.data.frame() %>%
+  tibble::rownames_to_column("Parameter") %>%
+  dplyr::rename(wip = ".") %>%
+  dplyr::mutate(wip = formatC(round(wip, 2), format = "f", digits = 2, flag = "0"))
+
+results <- left_join(results, varimp, by = "Parameter")  # Add wip column
+
+
+modgof <- top.mod.params %>% # Get model fit statistics (df,  AICc,logLik, delta, weight)
+  dplyr::select(df:weight) %>%
+  dplyr::mutate(across(everything(), ~ formatC(as.numeric(.), format = "f", digits = 3, flag = "0"))) %>%
+  t() %>%
+  as.data.frame() %>%
+  setNames(as.character(1:length(topmods))) %>%
+  tibble::rownames_to_column("Parameter") %>%
+  dplyr::mutate("Estimate" = NA, "Std. Error" = NA, `95%CI` = NA, wip = NA)  # Add empty columns to match results
+
+results <- bind_rows(results, modgof)
+
+results <- results %>%
+  dplyr::mutate(across(c("Estimate", "Std. Error"), ~ formatC(as.numeric(.), format = "f", digits = 3, flag = "0")),
+         wip = formatC(as.numeric(wip), format = "f", digits = 2, flag = "0"))
+
+fit_rows <- which(results$Parameter %in% c("df", "logLik", "AICc", "delta", "weight"))
+results[fit_rows, which(names(results) %in% c("Estimate", "Std. Error", "95%CI", "wip"))] <- ""
+
+
+results <- results %>%
+  dplyr::rename("β" = "Estimate", SE = "Std. Error") %>% #Cleanup parameter and column names
+  dplyr::mutate(
+    Parameter = gsub("c\\.", "", Parameter),
+    Parameter = gsub("z\\.", "", Parameter),
+    Parameter = gsub("bound_area", "boundary area", Parameter))
+
+results$Parameter <-c("(Intercept)","Relative Nest Height","Lay Date","Mainland","Lay Date*Mainland or Island","Relative Nest Height*Mainland or Island","df","logLik","AICc","ΔAICc","weight")
+                      
+rm(top.mod.params, ci, varimp, modgof)
+mod_n <- length(topmods)
+par_n <- nrow(modvars)
+colnames(results)[colnames(results) == "Parameter"] <- "Explanatory Variable"
+MUMIN_Mainland_Island<- kable(results, booktabs = TRUE, align = c('l', rep('c', mod_n), rep('r', 4))) %>% #Generate a mumin table
+  kable_classic(full_width = FALSE, position = "left", html_font = "Arial") %>%
+  add_header_above(c(" " = 1, "Model rank" = mod_n, "Model averaged coefficients" = 4)) %>%
+  column_spec(2:(mod_n + 1), width = "1.7cm") %>%
+  column_spec((mod_n + 2):(mod_n + 3), width = "1.5cm") %>%
+  column_spec(mod_n + 4, width = "3cm") %>%
+  column_spec(mod_n + 5, width = "1.3cm") %>%
+  row_spec(par_n, extra_css = "border-bottom: 1px dotted") %>%
+  row_spec(0, extra_css = "border-bottom: 1px solid")
+MUMIN_Mainland_Island
+```
+### Generating predicted predation graphs.
+
+```{r, warning=FALSE}
+#Using predict to generate predicted depredation for all data points in the data set from the GLM
+prediction_data <- (clean_Real_data[, c("arcsineprop", "Date.of.lay.as.a.factor","Year","Mainland.or.Island")])
+predictions_mainland <- predict(Mainland_Island_Model, type = "response", newdata = prediction_data)
+#Using ggplot to plot these predictions 
+MAINLAND_VS_ISLAND_PREDICTIONS<- ggplot(clean_Real_data, aes(x = Date.of.lay.as.a.factor, y = predictions_mainland, color = Mainland.or.Island)) +geom_point(aes(color= Mainland.or.Island))+scale_color_manual(values=c("Mainland"="#79CDCD","Island" = "#FF7256"))+
+  scale_shape_manual(values=c()) +
+  geom_smooth(method = "glm", method.args = list(family = "binomial")) +
+  labs(title = "",
+       x = "Lay Date (September 1st = 1)",
+       y = "Predicted Probability of Predation",
+       color = "")+theme(legend.key = element_rect(fill = "transparent"))+theme(
+    # Font Change :)
+    text = element_text(family = "arial", size = 12, color = "black"),
+    plot.title = element_text(
+      family = "arial", 
+      size = 12,
+      face = "bold",
+      color = "#2a475e"
+    ), panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+   panel.border = element_blank(),       # Remove full panel border
+    axis.line = element_line(color = "black"), # Keep axis lines
+    axis.line.x.top = element_blank(),    # Remove top axis line
+    axis.line.y.right = element_blank(),
+    panel.background = element_blank())+guides(color=guide_legend(override.aes=list(fill=NA)))
+MAINLAND_VS_ISLAND_PREDICTIONS
+```
+
+### Cox's proportional hazard code. 
+```{r}
+Cox_Data_All <- na.omit(Silvereye_data_Cox[, c("Predated.or.not", "Days.survived", "Proportional.nest.height", "Date.of.lay.as.a.factor","Proportional.position.in.branch","Year","Fake.or.real","Mainland.or.Island")]) #Remove NA's 
+Cox_Data_Real<-Cox_Data_All[Cox_Data_All$Fake.or.real == 1,] #Choosing only natural nests
+Cox_Data_Real$Proportional.nest.height<- as.numeric(Cox_Data_Real$Proportional.nest.height)
+Cox_Data_Real$arcsine_prop<- asin(sqrt((Cox_Data_Real$Proportional.nest.height)/100)) #Generating an arcsine(proportional nest height) column
+Cox_Data_Real$Predated.or.not<- as.numeric(Cox_Data_Real$Predated.or.not)#Making sure all variables are numeric or as factors
+Cox_Data_Real$Days.survived<- as.numeric(Cox_Data_Real$Days.survived)
+Cox_Data_Real$Date.of.lay.as.a.factor<- as.numeric(Cox_Data_Real$Date.of.lay.as.a.factor)
+Cox_Data_Real$arcsine_prop<- as.numeric(Cox_Data_Real$arcsine_prop)
+Cox_Data_Real$Mainland.or.Island<- as.factor(Cox_Data_Real$Mainland.or.Island)
+#Running a cox's proportional hazard model investigating the difference in survival between the mainland and island
+cox_model_Island_vs_Mainland <- coxph(Surv(Cox_Data_Real$Days.survived, Cox_Data_Real$Predated.or.not)~arcsine_prop+Date.of.lay.as.a.factor+Mainland.or.Island+Mainland.or.Island*Date.of.lay.as.a.factor+Mainland.or.Island*arcsine_prop, data = Cox_Data_Real,na.action = "na.omit")
+summary(cox_model_Island_vs_Mainland) #View results
+ph_test <- cox.zph(cox_model_Island_vs_Mainland) #Schoenfield test for proportionality of hazards
+ph_test
+ggcoxdiagnostics(cox_model_Island_vs_Mainland, type = , linear.predictions = TRUE) #Checking the linearity of the model
+print(ph_test)
+plot(ph_test)
+```
+### Logistic growth modelling
+```{r}
+#### First subset the data into mainland or island
+Growth_data_mainland <- subset(Silvereye_data_Growth, Mainland.or.Island == '1')
+Growth_data_island <-subset(Silvereye_data_Growth, Mainland.or.Island == '0')
+Growth_data_island <- na.omit(Growth_data_island[, c("day","digital.weight","nest","Chick.ID","Mainland.or.Island","tarsus","wing")])
+#Fit a growth curve with no random effects or other variables, to extract starting estimates to use in the nlme analysis
+gc_fit_mainland <- SummarizeGrowth(Growth_data_mainland$day, Growth_data_mainland$digital.weight)
+plot(gc_fit_mainland)+scale_y_continuous(limits = c(0, 12)) # plot your data and logistic growth curves. 
+gc_fit_mainland     # view some returned metrics, as we need start values for growth rate coefficient (r), asymptote (k), and inflection point (t-mid)
+asymptote <- gc_fit_mainland$vals$k #This is asymptote estimate. 
+cat("Estimated asymptote (K):", asymptote, "\n")# Asymptote estimate
+inflection_time <- gc_fit_mainland$vals$t_mid #This estimates the inflection point. 
+cat("Estimated inflection point (time of max growth rate):", inflection_time, "\n") 
+
+
+#Repeat for the island data
+
+gc_fit <- SummarizeGrowth(Growth_data_island$day, Growth_data_island$digital.weight)  #Summarise the logistic growth 
+plot(gc_fit)+scale_y_continuous(
+    limits = c(0, 12))                             # plot your data and the best fit
+gc_fit      # view some returned metrics as detailed above. 
+asymptote <- gc_fit$vals$k
+cat("Estimated asymptote (K):", asymptote, "\n")
+inflection_time <- gc_fit$vals$t_mid
+cat("Estimated inflection point (time of max growth rate):", inflection_time, "\n")
+
+#Growth data analysis adapted from Sofaer et al., 2013
+
+### First we analyse the growht rate of only the mainland population
+
+# Define a logistic function.
+OnePop = function(Age, Asym, xmid, K){
+  Asym/(1 + exp((xmid - Age)*K))
+}
+# Calculate the derivatives of the function
+DerivOnePop = deriv(body(OnePop)[[2]], namevec = c("Asym", "xmid", "K"), function.arg=
+                      OnePop)
+# Starting values; these can be estimates from nls (i.e. a model without random effects), or from previous studies. In this case calculated from the model without random effects using Growthcurver package for the mainland population.
+startOnePop = c(Asym = 6.957, xmid = 3.504698, K = 0.757)
+
+Mainland_Ai_NestNestling = nlme(digital.weight ~ DerivOnePop(day, Asym, xmid, K), data =
+                                Growth_data_mainland, fixed = Asym + xmid + K ~ 1, random = Asym + xmid ~ 1 | nest/Chick.ID,
+                              start = startOnePop)
+summary(Mainland_Ai_NestNestling)
+
+
+###And for the island only
+startOnePop = c(Asym = 19.659, xmid = 2.906, K = 0.379)
+Island_Ai_NestNestling = nlme(digital.weight ~ DerivOnePop(day, Asym, xmid, K), data =
+                                Growth_data_island, fixed = Asym + xmid + K ~ 1, random = Asym + xmid ~ 1 | nest/Chick.ID,
+                              start = startOnePop)
+summary(Island_Ai_NestNestling)
+
+# The goal here is to look for differences between the three logistic growth functions over the two populations. 
+Growth_data = (na.omit(Silvereye_data_Growth[, c("day","digital.weight","nest","Chick.ID","Mainland.or.Island","tarsus","wing")]))
+#Define the logistic growth function with the site and delta terms (Kdiff, midiff, and Adiff)
+Fuction_site_age_growth_coefficients = function(Age, site, Asym, xmid, K, Kdiff, middiff, Adiff){
+  (Asym + Adiff*site)/(1 + exp(((xmid+middiff*site) -
+                                  Age)*(K+Kdiff*site)))
+}
+#Calculate the derivatives of that function. 
+Deriv_Function = deriv(body(Fuction_site_age_growth_coefficients)[[2]], namevec = c("Asym", "xmid", "K",
+                                                             "Kdiff", "middiff", "Adiff"), function.arg= Fuction_site_age_growth_coefficients)
+# Starting values, extracted from the growth rate values extracted above. These just give the model a place to start from. 
+startvaluesmainland = c(Asym = 10.743, xmid = 3.541, K = 0.519, Kdiff=0, middiff=0, Adiff = 0) #Using mainland growth rate starting values.
+# Top-ranked model from Sandvig, 2022, Random effects of nest and nestling on the asymptotic mass and the
+# inflection point are the most accurate. With no random effect on growht rate. 
+Random_effect_model_Asym_Inflect = nlme(digital.weight ~ Deriv_Function(day, Mainland.or.Island, Asym, xmid, K, Kdiff, middiff, Adiff), fixed = Asym + xmid + K +
+                                     Kdiff + middiff + Adiff ~ 1, random = Asym + xmid ~ 1 | nest/Chick.ID, data =
+                                   Growth_data, start = startvaluesmainland)
+summary(Random_effect_model_Asym_Inflect)
+intervals(Random_effect_model_Asym_Inflect, which = "var-cov")
+```
+### Graphically showing the growth rates between the two populations. 
+```{R}
+
+
+# This creates average growth curve data, using the mainland only model with a random effect on Asymptote and Inflection point
+time_seq <- Growth_data_mainland$day
+nest <- Growth_data_mainland$nest
+Chick.ID <- Growth_data_mainland$Chick.ID
+Mainland.or.Island <-Growth_data_mainland$Mainland.or.Island
+growthplot_data_mainland <- data.frame(day = time_seq, nest = nest, Chick.ID = Chick.ID, Mainland.or.Island = Mainland.or.Island)
+growthplot_data_mainland$growth <- predict(Mainland_Ai_NestNestling, newdata = growthplot_data_mainland)
+
+#This creates average growth curve data, using the island only model with a random effect on Asymptote and Inflection point
+time_seqisland <- Growth_data_island$day
+nestisland <- Growth_data_island$nest
+Chick.IDisland <- Growth_data_island$Chick.ID
+Mainland.or.Islandisland <-Growth_data_island$Mainland.or.Island
+growthplot_data_island <- data.frame(day = time_seqisland, nest = nestisland, Chick.ID = Chick.IDisland, Mainland.or.Island= Mainland.or.Islandisland)
+growthplot_data_island$growth <- predict(Island_Ai_NestNestling, newdata = growthplot_data_island)
+
+#Combine both mainland and island average growth rates
+growth_data <-rbind(growthplot_data_island, growthplot_data_mainland)
+growth_data$Mainland.or.Island <- as.factor(growth_data$Mainland.or.Island)
+growth_data_for_ggplot <- Growth_data
+growth_data_for_ggplot$Mainland.or.Island <- as.factor(growth_data_for_ggplot$Mainland.or.Island)
+# 4. Plot these over time using GGplot, and geom_smooth
+Weight <- ggplot(growth_data_for_ggplot, aes(x = day, y = digital.weight,color= Mainland.or.Island))+scale_color_manual(values=c("1"="#79CDCD","0" = "#FF7256"),labels = c('Island', 'Mainland')) +
+  geom_point(alpha = 1) + # Raw data points
+  geom_smooth(data = growth_data, aes(x = day, y = growth, group = Mainland.or.Island), linewidth = 1.2) + theme(axis.text.x = element_text(hjust = 1), text = element_text(family = "Arial", size = 14, color = "black"),
+    plot.title = element_text(
+      size = 14,
+      face = "bold",
+      color = "#2a475e"),panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),panel.background = element_blank(),
+    panel.border = element_blank(),axis.line = element_line(colour = "black"))+
+  labs(title = "Individual and Average Logistic Growth Curves",
+       x = "Day", y = "Weight (g)", color= "Mainland or Island")+
+scale_x_continuous(breaks = c(0,2,4,6,8,10,12)) +
+scale_y_continuous(breaks = c(2,4,6,8,10,12))+ guides(color=guide_legend(override.aes=list(fill=NA)))
+Weight
+
+```
+
+
+
+
